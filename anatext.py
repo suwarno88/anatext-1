@@ -14,9 +14,10 @@ from Sastrawi.Stemmer.StemmerFactory import StemmerFactory
 import re
 import json
 from collections import Counter
+from itertools import combinations
 from datetime import datetime
 
-APP_VERSION = "2.0.0-enhanced"
+APP_VERSION = "2.2.0-enhanced"
 
 # ============================================================
 #                  KONFIGURASI HALAMAN
@@ -81,6 +82,8 @@ if 'ner_results' not in st.session_state:
     st.session_state.ner_results = None
 if 'summary_cache' not in st.session_state:
     st.session_state.summary_cache = None
+if 'entity_network' not in st.session_state:
+    st.session_state.entity_network = None
 
 # ============================================================
 #                  CSS & THEME ENGINE
@@ -270,7 +273,7 @@ def render_elegant_header(mode):
         </p>
         <div style="margin-top: 10px;">
             <span style="background: {badge_bg}; color: {badge_text}; padding: 4px 14px; border-radius: 20px; font-size: 0.78rem; font-weight: 600;">
-                ✨ Sentiment · Clustering · NER · N-Gram · Network
+                ✨ Sentiment · Clustering · NER · N-Gram · Network · Entity Network
             </span>
         </div>
     </div>
@@ -418,7 +421,7 @@ def get_ngrams(text_series, n=2, top_k=10):
 
 # 4. NER Analysis (AI)
 def get_ner_ai(client, model, text_full):
-    """Mengekstrak Named Entities menggunakan GPT-4.1-nano."""
+    """Mengekstrak Named Entities menggunakan GPT-4o."""
     try:
         text_sample = text_full[:15000]
         prompt = f"""
@@ -687,6 +690,175 @@ def generate_cluster_scatter(tfidf_matrix, labels, topic_names, template):
     return fig
 
 
+# 9. Entity Co-occurrence Network
+def build_entity_cooccurrence(df_texts, ner_results, client, model):
+    """Membangun jaringan ko-kemunculan entitas berdasarkan kemunculan bersama dalam dokumen."""
+    if not ner_results:
+        return None, None
+
+    all_entities = []
+    entity_type_map = {}
+    for etype in ['Person', 'Organization', 'Location']:
+        for ent in ner_results.get(etype, []):
+            ent_clean = ent.strip()
+            if ent_clean:
+                all_entities.append(ent_clean)
+                entity_type_map[ent_clean] = etype
+
+    if len(all_entities) < 2:
+        return None, None
+
+    # Hitung ko-kemunculan: dua entitas muncul dalam dokumen yang sama
+    entity_freq = Counter()
+    cooccurrence = Counter()
+
+    for text in df_texts:
+        text_lower = text.lower() if isinstance(text, str) else ""
+        present = [e for e in all_entities if e.lower() in text_lower]
+        for e in present:
+            entity_freq[e] += 1
+        for pair in combinations(sorted(set(present)), 2):
+            cooccurrence[pair] += 1
+
+    # Bangun graph
+    G = nx.Graph()
+
+    type_colors = {
+        'Person': '#4ECDC4',
+        'Organization': '#45B7D1',
+        'Location': '#FFA07A'
+    }
+
+    for ent in all_entities:
+        if entity_freq.get(ent, 0) > 0:
+            G.add_node(ent,
+                       etype=entity_type_map.get(ent, 'Unknown'),
+                       freq=entity_freq.get(ent, 1),
+                       color=type_colors.get(entity_type_map.get(ent), '#cccccc'))
+
+    for (e1, e2), weight in cooccurrence.items():
+        if weight > 0:
+            G.add_edge(e1, e2, weight=weight)
+
+    return G, entity_type_map
+
+
+def render_entity_network_plotly(G, entity_type_map, theme_mode):
+    """Render jaringan ko-kemunculan entitas menggunakan Plotly."""
+    if G is None or len(G.nodes()) == 0:
+        return None
+
+    pos = nx.spring_layout(G, k=1.2, seed=42, iterations=80)
+
+    type_colors = {
+        'Person': '#4ECDC4',
+        'Organization': '#45B7D1',
+        'Location': '#FFA07A'
+    }
+
+    # Edges
+    edge_traces = []
+    for edge in G.edges(data=True):
+        x0, y0 = pos[edge[0]]
+        x1, y1 = pos[edge[1]]
+        w = edge[2].get('weight', 1)
+        edge_traces.append(go.Scatter(
+            x=[x0, x1, None], y=[y0, y1, None],
+            line=dict(width=max(0.5, min(w * 1.5, 8)), color='rgba(150,150,150,0.5)'),
+            hoverinfo='text',
+            hovertext=f"{edge[0]} ↔ {edge[1]}: {w}x ko-kemunculan",
+            mode='lines',
+            showlegend=False
+        ))
+
+    # Nodes per type for legend
+    fig = go.Figure()
+    for trace in edge_traces:
+        fig.add_trace(trace)
+
+    for etype, color in type_colors.items():
+        nodes_of_type = [n for n in G.nodes() if G.nodes[n].get('etype') == etype]
+        if not nodes_of_type:
+            continue
+        nx_list = [pos[n][0] for n in nodes_of_type]
+        ny_list = [pos[n][1] for n in nodes_of_type]
+        sizes = [max(15, min(G.nodes[n].get('freq', 1) * 8, 50)) for n in nodes_of_type]
+        hover = [f"<b>{n}</b><br>Tipe: {etype}<br>Frekuensi: {G.nodes[n].get('freq', 1)}<br>Koneksi: {G.degree(n)}" for n in nodes_of_type]
+
+        fig.add_trace(go.Scatter(
+            x=nx_list, y=ny_list,
+            mode='markers+text',
+            name=f"🔹 {etype} ({len(nodes_of_type)})",
+            text=nodes_of_type,
+            textposition="top center",
+            textfont=dict(size=9, color='white' if theme_mode == 'Dark' else '#1a1a2e'),
+            hoverinfo='text',
+            hovertext=hover,
+            marker=dict(size=sizes, color=color, line=dict(width=1.5, color='rgba(255,255,255,0.6)'),
+                        opacity=0.9)
+        ))
+
+    bg_color = '#0e1117' if theme_mode == 'Dark' else '#f8f9fb'
+    fig.update_layout(
+        showlegend=True,
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='center', x=0.5,
+                    font=dict(size=11)),
+        hovermode='closest',
+        paper_bgcolor=bg_color,
+        plot_bgcolor=bg_color,
+        margin=dict(b=20, l=20, r=20, t=50),
+        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        height=600
+    )
+    return fig
+
+
+def render_entity_network_matplotlib(G, entity_type_map, theme_mode):
+    """Render jaringan ko-kemunculan entitas menggunakan Matplotlib."""
+    if G is None or len(G.nodes()) == 0:
+        return None
+
+    type_colors = {
+        'Person': '#4ECDC4',
+        'Organization': '#45B7D1',
+        'Location': '#FFA07A'
+    }
+
+    fig_bg = '#0e1117' if theme_mode == 'Dark' else '#ffffff'
+    fig, ax = plt.subplots(figsize=(14, 9), facecolor=fig_bg)
+    ax.set_facecolor(fig_bg)
+
+    pos = nx.spring_layout(G, k=1.2, seed=42, iterations=80)
+
+    # Draw edges with varying width
+    edge_weights = [G[u][v].get('weight', 1) for u, v in G.edges()]
+    max_w = max(edge_weights) if edge_weights else 1
+    widths = [max(0.5, (w / max_w) * 4) for w in edge_weights]
+    nx.draw_networkx_edges(G, pos, width=widths, alpha=0.4, edge_color='gray', ax=ax)
+
+    # Draw nodes per type
+    for etype, color in type_colors.items():
+        nodes = [n for n in G.nodes() if G.nodes[n].get('etype') == etype]
+        if not nodes:
+            continue
+        sizes = [max(300, min(G.nodes[n].get('freq', 1) * 150, 2000)) for n in nodes]
+        nx.draw_networkx_nodes(G, pos, nodelist=nodes, node_color=color,
+                               node_size=sizes, alpha=0.9, ax=ax, label=f"{etype} ({len(nodes)})")
+
+    font_color = 'white' if theme_mode == 'Dark' else 'black'
+    nx.draw_networkx_labels(G, pos, font_size=8, font_color=font_color, font_weight='bold', ax=ax)
+
+    legend_color = 'white' if theme_mode == 'Dark' else 'black'
+    leg = ax.legend(loc='upper left', fontsize=9, framealpha=0.7)
+    for text in leg.get_texts():
+        text.set_color(legend_color)
+
+    ax.axis('off')
+    plt.tight_layout()
+    return fig
+
+
 # ============================================================
 #              STOPWORDS MANAGER (MODAL)
 # ============================================================
@@ -748,7 +920,7 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown(
-        f'<div class="footer-text">Developed by <b>Suwarno</b><br>Powered by <b>GPT-4.1</b> & <b>GPT-4.1-nano</b></div>',
+        f'<div class="footer-text">Developed by <b>Suwarno</b><br>Powered by <b>GPT-4o</b> & <b>GPT-4o-mini</b><br>v{APP_VERSION}</div>',
         unsafe_allow_html=True
     )
 
@@ -763,8 +935,8 @@ try:
 except Exception:
     api_key = ""
 client = OpenAI(api_key=api_key) if api_key else None
-MODEL_FAST = "gpt-4.1-nano"   # Sentimen, Topik Naming, NER (cepat & hemat)
-MODEL_SMART = "gpt-4.1"       # Summary Komprehensif (mendalam & detail)
+MODEL_FAST = "gpt-4o-mini"   # Sentimen, Topik Naming, NER (cepat & hemat)
+MODEL_SMART = "gpt-4o"       # Summary Komprehensif (mendalam & detail)
 
 # --- INPUT AREA ---
 container_input = st.container()
@@ -948,7 +1120,7 @@ if st.session_state.analysis_done and st.session_state.data is not None:
     st.write("")
 
     # --- TABS ---
-    t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs([
+    t1, t2, t3, t4, t5, t6, t7, t8, t9 = st.tabs([
         "📝 Ringkasan AI",
         "🎭 Sentimen",
         "📂 Topik",
@@ -956,7 +1128,8 @@ if st.session_state.analysis_done and st.session_state.data is not None:
         "🔠 Kata Kunci",
         "🔗 N-Gram",
         "👤 Entitas (NER)",
-        "🌐 Network"
+        "🌐 Network",
+        "🕸️ Jaringan Entitas"
     ])
 
     # ========================
@@ -1066,6 +1239,80 @@ if st.session_state.analysis_done and st.session_state.data is not None:
             "Keywords": st.column_config.TextColumn("Kata Kunci (Top 10)", width="large"),
             "Jumlah_Dokumen": st.column_config.NumberColumn("Jumlah Dok.", width="small")
         })
+
+        # Word Cloud per Topik
+        st.markdown("---")
+        st.markdown("#### ☁️ Word Cloud per Topik")
+        st.caption("Visualisasi kata-kata dominan untuk setiap topik/klaster yang teridentifikasi.")
+
+        wc_bg = 'black' if theme_mode == 'Dark' else 'white'
+        topic_names_list = df['Topik'].unique().tolist()
+        num_topics_wc = len(topic_names_list)
+
+        if num_topics_wc > 0:
+            # Tentukan grid layout: maks 3 kolom per baris
+            cols_per_row = min(3, num_topics_wc)
+            rows_needed = (num_topics_wc + cols_per_row - 1) // cols_per_row
+
+            topic_color_map = {}
+            for idx, detail in enumerate(st.session_state.topic_details):
+                topic_color_map[detail['Topik']] = TOPIC_COLORS[idx % len(TOPIC_COLORS)]
+
+            for row_idx in range(rows_needed):
+                cols_wc = st.columns(cols_per_row)
+                for col_idx in range(cols_per_row):
+                    topic_idx = row_idx * cols_per_row + col_idx
+                    if topic_idx >= num_topics_wc:
+                        break
+                    t_name = topic_names_list[topic_idx]
+                    t_color = topic_color_map.get(t_name, '#4facfe')
+                    topic_texts = df[df['Topik'] == t_name]['Teks_Clean']
+                    combined_text = " ".join(topic_texts.tolist())
+
+                    with cols_wc[col_idx]:
+                        if combined_text.strip():
+                            try:
+                                def make_color_func(base_color):
+                                    """Membuat fungsi warna gradasi dari warna dasar topik."""
+                                    r = int(base_color[1:3], 16)
+                                    g = int(base_color[3:5], 16)
+                                    b = int(base_color[5:7], 16)
+                                    def color_func(word, font_size, position, orientation, random_state=None, **kwargs):
+                                        # Variasi kecerahan berdasarkan font_size
+                                        factor = max(0.4, min(font_size / 80, 1.0))
+                                        ri = int(r * factor + (255 - r) * (1 - factor) * 0.3)
+                                        gi = int(g * factor + (255 - g) * (1 - factor) * 0.3)
+                                        bi = int(b * factor + (255 - b) * (1 - factor) * 0.3)
+                                        return f"rgb({min(ri,255)},{min(gi,255)},{min(bi,255)})"
+                                    return color_func
+
+                                wc_topic = WordCloud(
+                                    width=400, height=280,
+                                    background_color=wc_bg,
+                                    color_func=make_color_func(t_color),
+                                    max_words=50,
+                                    contour_width=0,
+                                    prefer_horizontal=0.7,
+                                    min_font_size=8
+                                ).generate(combined_text)
+
+                                fig_wc_t, ax_wc_t = plt.subplots(figsize=(5, 3.5), facecolor=wc_bg)
+                                ax_wc_t.imshow(wc_topic, interpolation='bilinear')
+                                ax_wc_t.axis("off")
+                                title_color = 'white' if theme_mode == 'Dark' else '#1a1a2e'
+                                doc_count = len(topic_texts)
+                                ax_wc_t.set_title(
+                                    f"{t_name}\n({doc_count} dokumen)",
+                                    fontsize=10, fontweight='bold', color=title_color,
+                                    pad=8
+                                )
+                                plt.tight_layout()
+                                st.pyplot(fig_wc_t)
+                                plt.close(fig_wc_t)
+                            except ValueError:
+                                st.info(f"Data tidak cukup untuk **{t_name}**")
+                        else:
+                            st.info(f"Tidak ada teks untuk **{t_name}**")
 
     # ========================
     # TAB 4: CROSS ANALYSIS (NEW)
@@ -1309,6 +1556,100 @@ if st.session_state.analysis_done and st.session_state.data is not None:
             st.warning("Data topik belum tersedia.")
 
     # ========================
+    # TAB 9: ENTITY NETWORK
+    # ========================
+    with t9:
+        st.markdown("### 🕸️ Visualisasi Jaringan Ko-kemunculan Entitas")
+        st.caption("Membangun jaringan berdasarkan entitas (Person, Organization, Location) yang muncul bersama dalam dokumen yang sama.")
+
+        if st.session_state.ner_results:
+            ner = st.session_state.ner_results
+            total_ents = len(ner.get('Person', [])) + len(ner.get('Organization', [])) + len(ner.get('Location', []))
+
+            if total_ents < 2:
+                st.warning("Entitas yang terdeteksi kurang dari 2. Jaringan ko-kemunculan tidak dapat dibangun.")
+            else:
+                # Build network
+                G, etype_map = build_entity_cooccurrence(
+                    df['Teks_Asli'].tolist(), ner, client, MODEL_FAST
+                )
+
+                if G is not None and len(G.nodes()) > 0:
+                    # Metrics
+                    en1, en2, en3, en4 = st.columns(4)
+                    with en1:
+                        st.metric("Total Node (Entitas)", len(G.nodes()))
+                    with en2:
+                        st.metric("Total Edge (Koneksi)", len(G.edges()))
+                    with en3:
+                        density = nx.density(G)
+                        st.metric("Kepadatan Jaringan", f"{density:.3f}")
+                    with en4:
+                        components = nx.number_connected_components(G)
+                        st.metric("Komponen Terhubung", components)
+
+                    st.markdown("---")
+
+                    ent_net_mode = st.radio(
+                        "Pilih mode visualisasi jaringan entitas:",
+                        ["Interaktif (Plotly)", "Statis (Matplotlib)"],
+                        horizontal=True,
+                        key="ent_net_mode"
+                    )
+
+                    if ent_net_mode == "Interaktif (Plotly)":
+                        fig_ent = render_entity_network_plotly(G, etype_map, theme_mode)
+                        if fig_ent:
+                            st.plotly_chart(fig_ent, use_container_width=True)
+                    else:
+                        fig_ent = render_entity_network_matplotlib(G, etype_map, theme_mode)
+                        if fig_ent:
+                            st.pyplot(fig_ent)
+                            plt.close(fig_ent)
+
+                    # Co-occurrence table
+                    st.markdown("---")
+                    st.markdown("#### 📋 Tabel Ko-kemunculan Entitas (Top Pasangan)")
+                    edge_data = []
+                    for u, v, d in sorted(G.edges(data=True), key=lambda x: x[2].get('weight', 0), reverse=True):
+                        edge_data.append({
+                            'Entitas 1': u,
+                            'Tipe 1': etype_map.get(u, '-'),
+                            'Entitas 2': v,
+                            'Tipe 2': etype_map.get(v, '-'),
+                            'Ko-kemunculan': d.get('weight', 0)
+                        })
+                    if edge_data:
+                        df_edges = pd.DataFrame(edge_data[:20])
+                        st.dataframe(df_edges, hide_index=True, use_container_width=True)
+                    else:
+                        st.info("Tidak ada pasangan entitas yang muncul bersama dalam dokumen yang sama.")
+
+                    # Top entities by degree centrality
+                    with st.expander("📊 Sentralitas Entitas (Degree Centrality)"):
+                        centrality = nx.degree_centrality(G)
+                        df_cent = pd.DataFrame([
+                            {'Entitas': k, 'Tipe': etype_map.get(k, '-'), 'Degree Centrality': round(v, 4)}
+                            for k, v in sorted(centrality.items(), key=lambda x: x[1], reverse=True)
+                        ])
+                        st.dataframe(df_cent, hide_index=True, use_container_width=True)
+
+                        if len(df_cent) > 0:
+                            fig_cent = px.bar(
+                                df_cent.head(15), x='Degree Centrality', y='Entitas',
+                                orientation='h', color='Tipe',
+                                color_discrete_map={'Person': '#4ECDC4', 'Organization': '#45B7D1', 'Location': '#FFA07A'},
+                                template=plotly_template, text=df_cent.head(15)['Degree Centrality'].apply(lambda x: f"{x:.3f}")
+                            )
+                            fig_cent.update_traces(textposition='outside')
+                            fig_cent.update_layout(yaxis={'categoryorder': 'total ascending'}, height=450)
+                            st.plotly_chart(fig_cent, use_container_width=True)
+                else:
+                    st.info("Tidak ada ko-kemunculan entitas yang terdeteksi dalam dokumen.")
+        else:
+            st.error("Hasil NER belum tersedia. Jalankan analisis terlebih dahulu.")
+
+    # ========================
     # EXPORT SECTION
     # ========================
     st.divider()
@@ -1345,6 +1686,3 @@ if st.session_state.analysis_done and st.session_state.data is not None:
             )
         else:
             st.button("📥 Generate laporan dulu", disabled=True, use_container_width=True)
-
-
-
