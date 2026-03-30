@@ -14,9 +14,10 @@ from Sastrawi.Stemmer.StemmerFactory import StemmerFactory
 import re
 import json
 from collections import Counter
+from itertools import combinations
 from datetime import datetime
 
-APP_VERSION = "2.0.0-enhanced"
+APP_VERSION = "2.4.1-enhanced"
 
 # ============================================================
 #                  KONFIGURASI HALAMAN
@@ -81,6 +82,10 @@ if 'ner_results' not in st.session_state:
     st.session_state.ner_results = None
 if 'summary_cache' not in st.session_state:
     st.session_state.summary_cache = None
+if 'entity_network' not in st.session_state:
+    st.session_state.entity_network = None
+if 'tab_insights' not in st.session_state:
+    st.session_state.tab_insights = {}
 
 # ============================================================
 #                  CSS & THEME ENGINE
@@ -270,7 +275,7 @@ def render_elegant_header(mode):
         </p>
         <div style="margin-top: 10px;">
             <span style="background: {badge_bg}; color: {badge_text}; padding: 4px 14px; border-radius: 20px; font-size: 0.78rem; font-weight: 600;">
-                ✨ Sentiment · Clustering · NER · N-Gram · Network
+                ✨ Sentiment · Clustering · NER · N-Gram · Network · Entity Network
             </span>
         </div>
     </div>
@@ -418,7 +423,7 @@ def get_ngrams(text_series, n=2, top_k=10):
 
 # 4. NER Analysis (AI)
 def get_ner_ai(client, model, text_full):
-    """Mengekstrak Named Entities menggunakan GPT-4.1-nano."""
+    """Mengekstrak Named Entities menggunakan GPT-4o."""
     try:
         text_sample = text_full[:15000]
         prompt = f"""
@@ -572,6 +577,171 @@ Gunakan **bold** untuk poin penting. Pastikan setiap klaim didukung oleh data ku
         return f"❌ Gagal menghasilkan ringkasan: {str(e)}"
 
 
+# 5b. Tab-Specific AI Insight Generator
+def generate_tab_insight(client, model, tab_key, context_data):
+    """Menghasilkan ringkasan AI spesifik untuk setiap tab analisis."""
+
+    tab_prompts = {
+        "sentimen": {
+            "title": "Analisis Sentimen",
+            "instruction": """Analisis distribusi sentimen secara mendalam. Jelaskan:
+1. Sentimen mana yang dominan dan mengapa berdasarkan konteks data
+2. Proporsi dan rasio antar sentimen (positif vs negatif vs netral)
+3. Apakah distribusi sentimen ini sehat atau mengkhawatirkan
+4. Faktor-faktor yang mungkin mempengaruhi dominasi sentimen tertentu
+5. Implikasi dan rekomendasi berdasarkan pola sentimen yang ditemukan"""
+        },
+        "topik": {
+            "title": "Analisis Tematik (Topik)",
+            "instruction": """Analisis topik-topik yang teridentifikasi secara mendalam. Jelaskan:
+1. Makna dan konteks setiap topik berdasarkan kata kunci pembentuknya
+2. Topik mana yang paling dominan/krusial dari segi jumlah dokumen
+3. Hubungan dan keterkaitan antar topik
+4. Apakah topik-topik saling mendukung atau bertentangan
+5. Implikasi tematik terhadap narasi keseluruhan data"""
+        },
+        "cross": {
+            "title": "Cross-Analysis: Sentimen × Topik",
+            "instruction": """Analisis hubungan silang antara sentimen dan topik. Jelaskan:
+1. Topik mana yang paling positif vs paling negatif
+2. Adakah topik kontroversial yang sentimennya terpolarisasi
+3. Topik mana yang perlu perhatian dan prioritas penanganan
+4. Mengapa topik tertentu mendapat respons sentimen yang berbeda
+5. Pola dan anomali dalam distribusi sentimen per topik"""
+        },
+        "katakunci": {
+            "title": "Analisis Kata Kunci",
+            "instruction": """Analisis kata kunci dan pola frekuensi kata. Jelaskan:
+1. Kata-kata dengan skor TF-IDF tertinggi dan signifikansinya
+2. Perbedaan antara kata frekuensi tinggi vs kata TF-IDF tinggi
+3. Apa yang bisa disimpulkan dari pola penggunaan kata
+4. Kosakata spesifik yang menunjukkan kecenderungan tertentu
+5. Hubungan kata kunci dominan dengan topik dan sentimen"""
+        },
+        "ngram": {
+            "title": "Analisis N-Gram (Frasa)",
+            "instruction": """Analisis frasa (N-Gram) yang sering muncul. Jelaskan:
+1. Makna dan konteks dari bigram dan trigram teratas
+2. Pola frasa apa yang muncul secara konsisten
+3. Apakah frasa-frasa tersebut menunjukkan narasi atau opini tertentu
+4. Perbandingan antara bigram, trigram, dan fourgram
+5. Hubungan frasa dominan dengan topik dan sentimen yang ditemukan"""
+        },
+        "ner": {
+            "title": "Analisis Entitas (NER)",
+            "instruction": """Analisis entitas yang terdeteksi. Jelaskan:
+1. Siapa saja tokoh/orang kunci dan relevansinya dalam konteks data
+2. Organisasi/lembaga yang muncul dan perannya
+3. Lokasi yang terdeteksi dan hubungannya dengan narasi data
+4. Keterkaitan antar entitas (person-organization-location)
+5. Implikasi kehadiran entitas-entitas tersebut terhadap temuan analisis"""
+        },
+        "network": {
+            "title": "Text Network Analysis",
+            "instruction": """Analisis jaringan teks (hubungan topik-kata kunci). Jelaskan:
+1. Struktur jaringan: topik mana yang paling terhubung dengan kata kunci beragam
+2. Apakah ada kata kunci yang menjembatani beberapa topik sekaligus
+3. Kepadatan dan pola konektivitas jaringan
+4. Topik mana yang paling terisolasi vs paling terintegrasi
+5. Implikasi struktur jaringan terhadap koherensi tematik data"""
+        },
+        "entity_network": {
+            "title": "Jaringan Ko-kemunculan Entitas",
+            "instruction": """Analisis jaringan ko-kemunculan entitas. Jelaskan:
+1. Entitas mana yang paling sentral (paling banyak terhubung)
+2. Pasangan entitas yang paling sering muncul bersama dan maknanya
+3. Pola hubungan antar tipe entitas (Person-Organization-Location)
+4. Kepadatan jaringan dan apa artinya bagi data
+5. Insight strategis dari pola ko-kemunculan entitas"""
+        },
+        "doc_keywords": {
+            "title": "Analisis Kata Kunci per Dokumen",
+            "instruction": """Analisis pola kata kunci di level dokumen individual. Jelaskan:
+1. Apakah kata kunci antar dokumen bervariasi atau cenderung seragam
+2. Perbandingan pola TF-IDF vs frekuensi mentah (Raw Count)
+3. Dokumen mana yang memiliki kata kunci paling unik/berbeda
+4. Hubungan antara kata kunci dokumen dengan topik klasternya
+5. Insight mengenai keragaman konten antar dokumen"""
+        },
+        "linguistik": {
+            "title": "Pola Linguistik",
+            "instruction": """Analisis pola linguistik keseluruhan data. Jelaskan:
+1. Interpretasi kata-kata dominan dan frasa paling sering muncul
+2. Pola bahasa apa yang muncul secara konsisten
+3. Kosakata spesifik yang menunjukkan kecenderungan tertentu
+4. Gaya bahasa dan register yang digunakan dalam corpus
+5. Hubungan temuan linguistik dengan topik dan sentimen"""
+        },
+        "kesimpulan": {
+            "title": "Kesimpulan & Rekomendasi Strategis",
+            "instruction": """Tuliskan kesimpulan komprehensif dan rekomendasi strategis. Jelaskan:
+1. 3-5 poin kesimpulan kunci yang merangkum seluruh temuan
+2. 3-5 rekomendasi aksi konkret dan spesifik berdasarkan data
+3. Prioritas tindakan dari yang paling mendesak
+4. Justifikasi berbasis data untuk setiap rekomendasi
+5. Potensi risiko jika temuan-temuan ini tidak ditindaklanjuti"""
+        }
+    }
+
+    tab_info = tab_prompts.get(tab_key, {})
+    title = tab_info.get("title", "Analisis")
+    instruction = tab_info.get("instruction", "Berikan analisis mendalam.")
+
+    prompt = f"""Anda adalah **Senior Data Analyst** berpengalaman di bidang Text Mining & NLP.
+Berikan ringkasan dan analisis mendalam untuk bagian **{title}** berdasarkan data berikut.
+
+═══════════════ DATA KONTEKS ═══════════════
+{context_data}
+
+═══════════════ INSTRUKSI ═══════════════
+{instruction}
+
+ATURAN:
+- Tulis dalam bahasa Indonesia yang profesional dan data-driven
+- Panjang: 200-300 kata, padat dan elaboratif
+- Gunakan **bold** untuk poin penting
+- Setiap klaim HARUS didukung oleh data kuantitatif yang tersedia
+- Berikan insight yang actionable, bukan sekadar deskripsi
+"""
+
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": (
+                    "Anda adalah konsultan data analytics senior. "
+                    "Tulis analisis yang mendalam, terstruktur, dan actionable. "
+                    "Selalu kaitkan temuan dengan data kuantitatif yang diberikan."
+                )},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.4,
+            max_tokens=2000
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return f"❌ Gagal menghasilkan ringkasan: {str(e)}"
+
+
+def render_tab_insight_ui(client, model, tab_key, context_data, label=""):
+    """Render UI tombol dan hasil ringkasan AI di setiap tab."""
+    st.markdown("---")
+    insight_label = label or tab_key.replace("_", " ").title()
+
+    if tab_key in st.session_state.tab_insights:
+        st.markdown(f"#### 🤖 Ringkasan AI: {insight_label}")
+        st.markdown(st.session_state.tab_insights[tab_key])
+        if st.button(f"🔄 Regenerasi Ringkasan", key=f"regen_{tab_key}"):
+            del st.session_state.tab_insights[tab_key]
+            st.rerun()
+    else:
+        if st.button(f"✨ Generate Ringkasan AI: {insight_label}", key=f"gen_{tab_key}", type="primary"):
+            with st.spinner(f"🤖 AI sedang menganalisis {insight_label}..."):
+                result = generate_tab_insight(client, model, tab_key, context_data)
+                st.session_state.tab_insights[tab_key] = result
+                st.rerun()
+
+
 # 6. Network Graph (Enhanced with Plotly for interactivity)
 def generate_text_network_plotly(topic_details, theme_mode):
     """Membuat network graph interaktif menggunakan Plotly."""
@@ -687,6 +857,175 @@ def generate_cluster_scatter(tfidf_matrix, labels, topic_names, template):
     return fig
 
 
+# 9. Entity Co-occurrence Network
+def build_entity_cooccurrence(df_texts, ner_results, client, model):
+    """Membangun jaringan ko-kemunculan entitas berdasarkan kemunculan bersama dalam dokumen."""
+    if not ner_results:
+        return None, None
+
+    all_entities = []
+    entity_type_map = {}
+    for etype in ['Person', 'Organization', 'Location']:
+        for ent in ner_results.get(etype, []):
+            ent_clean = ent.strip()
+            if ent_clean:
+                all_entities.append(ent_clean)
+                entity_type_map[ent_clean] = etype
+
+    if len(all_entities) < 2:
+        return None, None
+
+    # Hitung ko-kemunculan: dua entitas muncul dalam dokumen yang sama
+    entity_freq = Counter()
+    cooccurrence = Counter()
+
+    for text in df_texts:
+        text_lower = text.lower() if isinstance(text, str) else ""
+        present = [e for e in all_entities if e.lower() in text_lower]
+        for e in present:
+            entity_freq[e] += 1
+        for pair in combinations(sorted(set(present)), 2):
+            cooccurrence[pair] += 1
+
+    # Bangun graph
+    G = nx.Graph()
+
+    type_colors = {
+        'Person': '#4ECDC4',
+        'Organization': '#45B7D1',
+        'Location': '#FFA07A'
+    }
+
+    for ent in all_entities:
+        if entity_freq.get(ent, 0) > 0:
+            G.add_node(ent,
+                       etype=entity_type_map.get(ent, 'Unknown'),
+                       freq=entity_freq.get(ent, 1),
+                       color=type_colors.get(entity_type_map.get(ent), '#cccccc'))
+
+    for (e1, e2), weight in cooccurrence.items():
+        if weight > 0:
+            G.add_edge(e1, e2, weight=weight)
+
+    return G, entity_type_map
+
+
+def render_entity_network_plotly(G, entity_type_map, theme_mode):
+    """Render jaringan ko-kemunculan entitas menggunakan Plotly."""
+    if G is None or len(G.nodes()) == 0:
+        return None
+
+    pos = nx.spring_layout(G, k=1.2, seed=42, iterations=80)
+
+    type_colors = {
+        'Person': '#4ECDC4',
+        'Organization': '#45B7D1',
+        'Location': '#FFA07A'
+    }
+
+    # Edges
+    edge_traces = []
+    for edge in G.edges(data=True):
+        x0, y0 = pos[edge[0]]
+        x1, y1 = pos[edge[1]]
+        w = edge[2].get('weight', 1)
+        edge_traces.append(go.Scatter(
+            x=[x0, x1, None], y=[y0, y1, None],
+            line=dict(width=max(0.5, min(w * 1.5, 8)), color='rgba(150,150,150,0.5)'),
+            hoverinfo='text',
+            hovertext=f"{edge[0]} ↔ {edge[1]}: {w}x ko-kemunculan",
+            mode='lines',
+            showlegend=False
+        ))
+
+    # Nodes per type for legend
+    fig = go.Figure()
+    for trace in edge_traces:
+        fig.add_trace(trace)
+
+    for etype, color in type_colors.items():
+        nodes_of_type = [n for n in G.nodes() if G.nodes[n].get('etype') == etype]
+        if not nodes_of_type:
+            continue
+        nx_list = [pos[n][0] for n in nodes_of_type]
+        ny_list = [pos[n][1] for n in nodes_of_type]
+        sizes = [max(15, min(G.nodes[n].get('freq', 1) * 8, 50)) for n in nodes_of_type]
+        hover = [f"<b>{n}</b><br>Tipe: {etype}<br>Frekuensi: {G.nodes[n].get('freq', 1)}<br>Koneksi: {G.degree(n)}" for n in nodes_of_type]
+
+        fig.add_trace(go.Scatter(
+            x=nx_list, y=ny_list,
+            mode='markers+text',
+            name=f"🔹 {etype} ({len(nodes_of_type)})",
+            text=nodes_of_type,
+            textposition="top center",
+            textfont=dict(size=9, color='white' if theme_mode == 'Dark' else '#1a1a2e'),
+            hoverinfo='text',
+            hovertext=hover,
+            marker=dict(size=sizes, color=color, line=dict(width=1.5, color='rgba(255,255,255,0.6)'),
+                        opacity=0.9)
+        ))
+
+    bg_color = '#0e1117' if theme_mode == 'Dark' else '#f8f9fb'
+    fig.update_layout(
+        showlegend=True,
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='center', x=0.5,
+                    font=dict(size=11)),
+        hovermode='closest',
+        paper_bgcolor=bg_color,
+        plot_bgcolor=bg_color,
+        margin=dict(b=20, l=20, r=20, t=50),
+        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        height=600
+    )
+    return fig
+
+
+def render_entity_network_matplotlib(G, entity_type_map, theme_mode):
+    """Render jaringan ko-kemunculan entitas menggunakan Matplotlib."""
+    if G is None or len(G.nodes()) == 0:
+        return None
+
+    type_colors = {
+        'Person': '#4ECDC4',
+        'Organization': '#45B7D1',
+        'Location': '#FFA07A'
+    }
+
+    fig_bg = '#0e1117' if theme_mode == 'Dark' else '#ffffff'
+    fig, ax = plt.subplots(figsize=(14, 9), facecolor=fig_bg)
+    ax.set_facecolor(fig_bg)
+
+    pos = nx.spring_layout(G, k=1.2, seed=42, iterations=80)
+
+    # Draw edges with varying width
+    edge_weights = [G[u][v].get('weight', 1) for u, v in G.edges()]
+    max_w = max(edge_weights) if edge_weights else 1
+    widths = [max(0.5, (w / max_w) * 4) for w in edge_weights]
+    nx.draw_networkx_edges(G, pos, width=widths, alpha=0.4, edge_color='gray', ax=ax)
+
+    # Draw nodes per type
+    for etype, color in type_colors.items():
+        nodes = [n for n in G.nodes() if G.nodes[n].get('etype') == etype]
+        if not nodes:
+            continue
+        sizes = [max(300, min(G.nodes[n].get('freq', 1) * 150, 2000)) for n in nodes]
+        nx.draw_networkx_nodes(G, pos, nodelist=nodes, node_color=color,
+                               node_size=sizes, alpha=0.9, ax=ax, label=f"{etype} ({len(nodes)})")
+
+    font_color = 'white' if theme_mode == 'Dark' else 'black'
+    nx.draw_networkx_labels(G, pos, font_size=8, font_color=font_color, font_weight='bold', ax=ax)
+
+    legend_color = 'white' if theme_mode == 'Dark' else 'black'
+    leg = ax.legend(loc='upper left', fontsize=9, framealpha=0.7)
+    for text in leg.get_texts():
+        text.set_color(legend_color)
+
+    ax.axis('off')
+    plt.tight_layout()
+    return fig
+
+
 # ============================================================
 #              STOPWORDS MANAGER (MODAL)
 # ============================================================
@@ -748,7 +1087,7 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown(
-        f'<div class="footer-text">Developed by <b>Suwarno</b><br>Powered by <b>GPT-4.1</b> & <b>GPT-4.1-nano</b></div>',
+        f'<div class="footer-text">Developed by <b>Suwarno</b><br>Powered by <b>GPT-4o</b> & <b>GPT-4o-mini</b><br>v{APP_VERSION}</div>',
         unsafe_allow_html=True
     )
 
@@ -763,8 +1102,8 @@ try:
 except Exception:
     api_key = ""
 client = OpenAI(api_key=api_key) if api_key else None
-MODEL_FAST = "gpt-4.1-nano"   # Sentimen, Topik Naming, NER (cepat & hemat)
-MODEL_SMART = "gpt-4.1"       # Summary Komprehensif (mendalam & detail)
+MODEL_FAST = "gpt-4o-mini"   # Sentimen, Topik Naming, NER (cepat & hemat)
+MODEL_SMART = "gpt-4o"       # Summary Komprehensif (mendalam & detail)
 
 # --- INPUT AREA ---
 container_input = st.container()
@@ -903,6 +1242,7 @@ if run_analysis:
             st.session_state.topic_map = topic_map
             st.session_state.analysis_done = True
             st.session_state.summary_cache = None
+            st.session_state.tab_insights = {}
             st.rerun()
 
 
@@ -948,7 +1288,7 @@ if st.session_state.analysis_done and st.session_state.data is not None:
     st.write("")
 
     # --- TABS ---
-    t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs([
+    t1, t2, t3, t4, t5, t6, t7, t8, t9, t10 = st.tabs([
         "📝 Ringkasan AI",
         "🎭 Sentimen",
         "📂 Topik",
@@ -956,7 +1296,9 @@ if st.session_state.analysis_done and st.session_state.data is not None:
         "🔠 Kata Kunci",
         "🔗 N-Gram",
         "👤 Entitas (NER)",
-        "🌐 Network"
+        "🌐 Network",
+        "🕸️ Jaringan Entitas",
+        "📊 Kata Kunci/Dok"
     ])
 
     # ========================
@@ -1031,6 +1373,20 @@ if st.session_state.analysis_done and st.session_state.data is not None:
                 use_container_width=True, height=500
             )
 
+        # Ringkasan AI - Sentimen
+        total = len(df)
+        pos_pct = round(sc.get('Positif', 0) / total * 100, 1) if total else 0
+        neg_pct = round(sc.get('Negatif', 0) / total * 100, 1) if total else 0
+        net_pct = round(sc.get('Netral', 0) / total * 100, 1) if total else 0
+        ctx_sentimen = f"""Total Dokumen: {total}
+Distribusi Sentimen:
+- Positif: {sc.get('Positif', 0)} dokumen ({pos_pct}%)
+- Negatif: {sc.get('Negatif', 0)} dokumen ({neg_pct}%)
+- Netral: {sc.get('Netral', 0)} dokumen ({net_pct}%)
+Sentimen Dominan: {max(sc, key=sc.get) if sc else '-'}
+Tipe Teks: {text_type} | Bahasa: {language}"""
+        render_tab_insight_ui(client, MODEL_SMART, "sentimen", ctx_sentimen, "Analisis Sentimen")
+
     # ========================
     # TAB 3: TOPIK
     # ========================
@@ -1066,6 +1422,87 @@ if st.session_state.analysis_done and st.session_state.data is not None:
             "Keywords": st.column_config.TextColumn("Kata Kunci (Top 10)", width="large"),
             "Jumlah_Dokumen": st.column_config.NumberColumn("Jumlah Dok.", width="small")
         })
+
+        # Word Cloud per Topik
+        st.markdown("---")
+        st.markdown("#### ☁️ Word Cloud per Topik")
+        st.caption("Visualisasi kata-kata dominan untuk setiap topik/klaster yang teridentifikasi.")
+
+        wc_bg = 'black' if theme_mode == 'Dark' else 'white'
+        topic_names_list = df['Topik'].unique().tolist()
+        num_topics_wc = len(topic_names_list)
+
+        if num_topics_wc > 0:
+            # Tentukan grid layout: maks 3 kolom per baris
+            cols_per_row = min(3, num_topics_wc)
+            rows_needed = (num_topics_wc + cols_per_row - 1) // cols_per_row
+
+            topic_color_map = {}
+            for idx, detail in enumerate(st.session_state.topic_details):
+                topic_color_map[detail['Topik']] = TOPIC_COLORS[idx % len(TOPIC_COLORS)]
+
+            for row_idx in range(rows_needed):
+                cols_wc = st.columns(cols_per_row)
+                for col_idx in range(cols_per_row):
+                    topic_idx = row_idx * cols_per_row + col_idx
+                    if topic_idx >= num_topics_wc:
+                        break
+                    t_name = topic_names_list[topic_idx]
+                    t_color = topic_color_map.get(t_name, '#4facfe')
+                    topic_texts = df[df['Topik'] == t_name]['Teks_Clean']
+                    combined_text = " ".join(topic_texts.tolist())
+
+                    with cols_wc[col_idx]:
+                        if combined_text.strip():
+                            try:
+                                def make_color_func(base_color):
+                                    """Membuat fungsi warna gradasi dari warna dasar topik."""
+                                    r = int(base_color[1:3], 16)
+                                    g = int(base_color[3:5], 16)
+                                    b = int(base_color[5:7], 16)
+                                    def color_func(word, font_size, position, orientation, random_state=None, **kwargs):
+                                        # Variasi kecerahan berdasarkan font_size
+                                        factor = max(0.4, min(font_size / 80, 1.0))
+                                        ri = int(r * factor + (255 - r) * (1 - factor) * 0.3)
+                                        gi = int(g * factor + (255 - g) * (1 - factor) * 0.3)
+                                        bi = int(b * factor + (255 - b) * (1 - factor) * 0.3)
+                                        return f"rgb({min(ri,255)},{min(gi,255)},{min(bi,255)})"
+                                    return color_func
+
+                                wc_topic = WordCloud(
+                                    width=400, height=280,
+                                    background_color=wc_bg,
+                                    color_func=make_color_func(t_color),
+                                    max_words=50,
+                                    contour_width=0,
+                                    prefer_horizontal=0.7,
+                                    min_font_size=8
+                                ).generate(combined_text)
+
+                                fig_wc_t, ax_wc_t = plt.subplots(figsize=(5, 3.5), facecolor=wc_bg)
+                                ax_wc_t.imshow(wc_topic, interpolation='bilinear')
+                                ax_wc_t.axis("off")
+                                title_color = 'white' if theme_mode == 'Dark' else '#1a1a2e'
+                                doc_count = len(topic_texts)
+                                ax_wc_t.set_title(
+                                    f"{t_name}\n({doc_count} dokumen)",
+                                    fontsize=10, fontweight='bold', color=title_color,
+                                    pad=8
+                                )
+                                plt.tight_layout()
+                                st.pyplot(fig_wc_t)
+                                plt.close(fig_wc_t)
+                            except ValueError:
+                                st.info(f"Data tidak cukup untuk **{t_name}**")
+                        else:
+                            st.info(f"Tidak ada teks untuk **{t_name}**")
+
+        # Ringkasan AI - Topik
+        topics_str = "\n".join([f"  - Topik '{t['Topik']}': kata kunci [{t['Keywords']}], {t['Jumlah_Dokumen']} dokumen" for t in st.session_state.topic_details])
+        ctx_topik = f"""Total Dokumen: {len(df)} | Jumlah Topik: {df['Topik'].nunique()}
+Topik & Kata Kunci:
+{topics_str}"""
+        render_tab_insight_ui(client, MODEL_SMART, "topik", ctx_topik, "Analisis Tematik (Topik)")
 
     # ========================
     # TAB 4: CROSS ANALYSIS (NEW)
@@ -1117,6 +1554,15 @@ if st.session_state.analysis_done and st.session_state.data is not None:
         cross_display['% Negatif'] = (cross_display['Negatif'] / cross_display['Total'] * 100).round(1)
         st.dataframe(cross_display, use_container_width=True)
 
+        # Ringkasan AI - Cross Analysis
+        cross_data_lines = []
+        for topic in cross_display.index:
+            r = cross_display.loc[topic]
+            cross_data_lines.append(f"  - {topic}: Positif={r.get('Positif',0)}, Negatif={r.get('Negatif',0)}, Netral={r.get('Netral',0)}, Total={r.get('Total',0)}, %Positif={r.get('% Positif',0)}%, %Negatif={r.get('% Negatif',0)}%")
+        ctx_cross = f"""Cross-Tabulation Sentimen × Topik:
+{chr(10).join(cross_data_lines)}"""
+        render_tab_insight_ui(client, MODEL_SMART, "cross", ctx_cross, "Sentimen × Topik")
+
     # ========================
     # TAB 5: KATA KUNCI
     # ========================
@@ -1158,6 +1604,18 @@ if st.session_state.analysis_done and st.session_state.data is not None:
             fig_wf = px.bar(df_wf, x="Frekuensi", y="Kata", orientation='h', template=plotly_template)
             fig_wf.update_layout(yaxis={'categoryorder': 'total ascending'}, height=500)
             st.plotly_chart(fig_wf, use_container_width=True)
+
+        # Ringkasan AI - Kata Kunci
+        top_tfidf = [(word, round(sum_tfidf[0, idx], 3)) for word, idx in st.session_state.vectorizer.vocabulary_.items()]
+        top_tfidf = sorted(top_tfidf, key=lambda x: x[1], reverse=True)[:15]
+        tfidf_str = ", ".join([f"{w} ({s})" for w, s in top_tfidf])
+        all_w = txt_all.split() if txt_all.strip() else []
+        raw_top = Counter(all_w).most_common(15)
+        raw_str = ", ".join([f"{w} ({c}x)" for w, c in raw_top])
+        ctx_kk = f"""Top 15 Kata Kunci (TF-IDF): {tfidf_str}
+Top 15 Frekuensi Kata Mentah: {raw_str}
+Total Kata Unik: {len(set(all_w))} | Total Kata: {len(all_w)}"""
+        render_tab_insight_ui(client, MODEL_SMART, "katakunci", ctx_kk, "Analisis Kata Kunci")
 
     # ========================
     # TAB 6: N-GRAM
@@ -1213,6 +1671,18 @@ if st.session_state.analysis_done and st.session_state.data is not None:
                 st.plotly_chart(fig_fg, use_container_width=True)
             else:
                 st.info("Data tidak cukup untuk analisis Fourgram.")
+
+        # Ringkasan AI - N-Gram
+        bigrams_ctx = get_ngrams(df['Teks_Clean'], n=2, top_k=10)
+        trigrams_ctx = get_ngrams(df['Teks_Clean'], n=3, top_k=10)
+        fourgrams_ctx = get_ngrams(df['Teks_Clean'], n=4, top_k=5)
+        bi_str = ", ".join([f"'{b[0]}' ({b[1]}x)" for b in bigrams_ctx]) if bigrams_ctx else "tidak cukup data"
+        tri_str = ", ".join([f"'{t[0]}' ({t[1]}x)" for t in trigrams_ctx]) if trigrams_ctx else "tidak cukup data"
+        four_str = ", ".join([f"'{f[0]}' ({f[1]}x)" for f in fourgrams_ctx]) if fourgrams_ctx else "tidak cukup data"
+        ctx_ngram = f"""Bigram (2 kata) teratas: {bi_str}
+Trigram (3 kata) teratas: {tri_str}
+Fourgram (4 kata) teratas: {four_str}"""
+        render_tab_insight_ui(client, MODEL_SMART, "ngram", ctx_ngram, "Analisis N-Gram")
 
     # ========================
     # TAB 7: NER
@@ -1285,6 +1755,19 @@ if st.session_state.analysis_done and st.session_state.data is not None:
         else:
             st.error("Gagal memuat hasil NER.")
 
+        # Ringkasan AI - NER
+        if st.session_state.ner_results:
+            ner_r = st.session_state.ner_results
+            persons_ctx = ner_r.get('Person', [])
+            orgs_ctx = ner_r.get('Organization', [])
+            locs_ctx = ner_r.get('Location', [])
+            ctx_ner = f"""Entitas Terdeteksi:
+- Person ({len(persons_ctx)}): {', '.join(persons_ctx[:15]) if persons_ctx else 'tidak terdeteksi'}
+- Organization ({len(orgs_ctx)}): {', '.join(orgs_ctx[:15]) if orgs_ctx else 'tidak terdeteksi'}
+- Location ({len(locs_ctx)}): {', '.join(locs_ctx[:15]) if locs_ctx else 'tidak terdeteksi'}
+Total Entitas: {len(persons_ctx) + len(orgs_ctx) + len(locs_ctx)}"""
+            render_tab_insight_ui(client, MODEL_SMART, "ner", ctx_ner, "Analisis Entitas (NER)")
+
     # ========================
     # TAB 8: NETWORK
     # ========================
@@ -1307,6 +1790,376 @@ if st.session_state.analysis_done and st.session_state.data is not None:
                 plt.close()
         else:
             st.warning("Data topik belum tersedia.")
+
+        # Ringkasan AI - Network
+        if st.session_state.topic_details:
+            net_lines = []
+            for td in st.session_state.topic_details:
+                net_lines.append(f"  - {td['Topik']}: kata kunci [{td['Keywords']}]")
+            ctx_net = f"""Topik dalam jaringan ({len(st.session_state.topic_details)} topik):
+{chr(10).join(net_lines)}
+Setiap topik terhubung dengan kata kunci dominannya dalam graph."""
+            render_tab_insight_ui(client, MODEL_SMART, "network", ctx_net, "Text Network Analysis")
+
+    # ========================
+    # TAB 9: ENTITY NETWORK
+    # ========================
+    with t9:
+        st.markdown("### 🕸️ Visualisasi Jaringan Ko-kemunculan Entitas")
+        st.caption("Membangun jaringan berdasarkan entitas (Person, Organization, Location) yang muncul bersama dalam dokumen yang sama.")
+
+        if st.session_state.ner_results:
+            ner = st.session_state.ner_results
+            total_ents = len(ner.get('Person', [])) + len(ner.get('Organization', [])) + len(ner.get('Location', []))
+
+            if total_ents < 2:
+                st.warning("Entitas yang terdeteksi kurang dari 2. Jaringan ko-kemunculan tidak dapat dibangun.")
+            else:
+                # Build network
+                G, etype_map = build_entity_cooccurrence(
+                    df['Teks_Asli'].tolist(), ner, client, MODEL_FAST
+                )
+
+                if G is not None and len(G.nodes()) > 0:
+                    # Metrics
+                    en1, en2, en3, en4 = st.columns(4)
+                    with en1:
+                        st.metric("Total Node (Entitas)", len(G.nodes()))
+                    with en2:
+                        st.metric("Total Edge (Koneksi)", len(G.edges()))
+                    with en3:
+                        density = nx.density(G)
+                        st.metric("Kepadatan Jaringan", f"{density:.3f}")
+                    with en4:
+                        components = nx.number_connected_components(G)
+                        st.metric("Komponen Terhubung", components)
+
+                    st.markdown("---")
+
+                    ent_net_mode = st.radio(
+                        "Pilih mode visualisasi jaringan entitas:",
+                        ["Interaktif (Plotly)", "Statis (Matplotlib)"],
+                        horizontal=True,
+                        key="ent_net_mode"
+                    )
+
+                    if ent_net_mode == "Interaktif (Plotly)":
+                        fig_ent = render_entity_network_plotly(G, etype_map, theme_mode)
+                        if fig_ent:
+                            st.plotly_chart(fig_ent, use_container_width=True)
+                    else:
+                        fig_ent = render_entity_network_matplotlib(G, etype_map, theme_mode)
+                        if fig_ent:
+                            st.pyplot(fig_ent)
+                            plt.close(fig_ent)
+
+                    # Co-occurrence table
+                    st.markdown("---")
+                    st.markdown("#### 📋 Tabel Ko-kemunculan Entitas (Top Pasangan)")
+                    edge_data = []
+                    for u, v, d in sorted(G.edges(data=True), key=lambda x: x[2].get('weight', 0), reverse=True):
+                        edge_data.append({
+                            'Entitas 1': u,
+                            'Tipe 1': etype_map.get(u, '-'),
+                            'Entitas 2': v,
+                            'Tipe 2': etype_map.get(v, '-'),
+                            'Ko-kemunculan': d.get('weight', 0)
+                        })
+                    if edge_data:
+                        df_edges = pd.DataFrame(edge_data[:20])
+                        st.dataframe(df_edges, hide_index=True, use_container_width=True)
+                    else:
+                        st.info("Tidak ada pasangan entitas yang muncul bersama dalam dokumen yang sama.")
+
+                    # Top entities by degree centrality
+                    with st.expander("📊 Sentralitas Entitas (Degree Centrality)"):
+                        centrality = nx.degree_centrality(G)
+                        df_cent = pd.DataFrame([
+                            {'Entitas': k, 'Tipe': etype_map.get(k, '-'), 'Degree Centrality': round(v, 4)}
+                            for k, v in sorted(centrality.items(), key=lambda x: x[1], reverse=True)
+                        ])
+                        st.dataframe(df_cent, hide_index=True, use_container_width=True)
+
+                        if len(df_cent) > 0:
+                            fig_cent = px.bar(
+                                df_cent.head(15), x='Degree Centrality', y='Entitas',
+                                orientation='h', color='Tipe',
+                                color_discrete_map={'Person': '#4ECDC4', 'Organization': '#45B7D1', 'Location': '#FFA07A'},
+                                template=plotly_template, text=df_cent.head(15)['Degree Centrality'].apply(lambda x: f"{x:.3f}")
+                            )
+                            fig_cent.update_traces(textposition='outside')
+                            fig_cent.update_layout(yaxis={'categoryorder': 'total ascending'}, height=450)
+                            st.plotly_chart(fig_cent, use_container_width=True)
+                else:
+                    st.info("Tidak ada ko-kemunculan entitas yang terdeteksi dalam dokumen.")
+        else:
+            st.error("Hasil NER belum tersedia. Jalankan analisis terlebih dahulu.")
+
+        # Ringkasan AI - Entity Network
+        if st.session_state.ner_results:
+            ner_en = st.session_state.ner_results
+            G_ctx, emap_ctx = build_entity_cooccurrence(df['Teks_Asli'].tolist(), ner_en, client, MODEL_FAST)
+            if G_ctx and len(G_ctx.nodes()) > 0:
+                top_edges = sorted(G_ctx.edges(data=True), key=lambda x: x[2].get('weight', 0), reverse=True)[:10]
+                edges_str = ", ".join([f"{u}↔{v} ({d.get('weight',0)}x)" for u, v, d in top_edges])
+                cent_ctx = nx.degree_centrality(G_ctx)
+                top_cent = sorted(cent_ctx.items(), key=lambda x: x[1], reverse=True)[:5]
+                cent_str = ", ".join([f"{k} ({round(v,3)})" for k, v in top_cent])
+                ctx_ent_net = f"""Jaringan Entitas:
+- Total Node: {len(G_ctx.nodes())} | Total Edge: {len(G_ctx.edges())}
+- Kepadatan: {nx.density(G_ctx):.3f} | Komponen: {nx.number_connected_components(G_ctx)}
+- Top Pasangan Ko-kemunculan: {edges_str}
+- Top Entitas Sentral (Degree): {cent_str}"""
+                render_tab_insight_ui(client, MODEL_SMART, "entity_network", ctx_ent_net, "Jaringan Ko-kemunculan Entitas")
+
+    # ========================
+    # TAB 10: KATA KUNCI PER DOKUMEN
+    # ========================
+    with t10:
+        st.markdown("### 📊 10 Kata Kunci Teratas per Dokumen")
+        st.caption("Menampilkan 10 kata kunci dengan skor TF-IDF tertinggi beserta frekuensi kemunculan (Raw Count) di setiap dokumen.")
+
+        if hasattr(st.session_state, 'tfidf_matrix') and hasattr(st.session_state, 'vectorizer'):
+            tfidf_mat = st.session_state.tfidf_matrix
+            feature_names = st.session_state.vectorizer.get_feature_names_out()
+            total_docs = len(df)
+
+            # Helper: hitung frekuensi kata dalam satu dokumen
+            def get_word_freq_doc(doc_text):
+                words = doc_text.split()
+                return Counter(words)
+
+            # --- Mode Pilihan ---
+            doc_view_mode = st.radio(
+                "Mode tampilan:",
+                ["📄 Pilih Dokumen", "📑 Semua Dokumen (Grid)"],
+                horizontal=True,
+                key="doc_kw_mode"
+            )
+
+            if doc_view_mode == "📄 Pilih Dokumen":
+                # Preview teks untuk membantu pemilihan
+                doc_options = []
+                for i in range(total_docs):
+                    preview = df['Teks_Asli'].iloc[i]
+                    preview_short = (preview[:80] + "...") if len(preview) > 80 else preview
+                    doc_options.append(f"Dokumen {i + 1}: {preview_short}")
+
+                selected_doc = st.selectbox(
+                    "Pilih dokumen:", doc_options, key="doc_kw_select"
+                )
+                doc_idx = doc_options.index(selected_doc)
+
+                # Ambil top 10 kata kunci untuk dokumen terpilih
+                row = tfidf_mat[doc_idx].toarray().flatten()
+                top_indices = row.argsort()[-10:][::-1]
+                top_words = [(feature_names[i], round(row[i], 4)) for i in top_indices if row[i] > 0]
+
+                if top_words:
+                    # Info dokumen
+                    st.markdown(f"**Dokumen #{doc_idx + 1}** — Topik: `{df['Topik'].iloc[doc_idx]}` | Sentimen: `{df['Sentimen'].iloc[doc_idx]}`")
+                    with st.expander("📖 Lihat Teks Lengkap", expanded=False):
+                        st.write(df['Teks_Asli'].iloc[doc_idx])
+
+                    # Hitung frekuensi kata untuk dokumen ini
+                    word_freq = get_word_freq_doc(df['Teks_Clean'].iloc[doc_idx])
+
+                    # Bangun dataframe gabungan
+                    combined_data = []
+                    for kata, skor in top_words:
+                        combined_data.append({
+                            "Kata Kunci": kata,
+                            "Skor TF-IDF": skor,
+                            "Frekuensi": word_freq.get(kata, 0)
+                        })
+                    df_doc_kw = pd.DataFrame(combined_data)
+
+                    # --- Dua chart berdampingan ---
+                    chart_left, chart_right = st.columns(2)
+
+                    with chart_left:
+                        fig_tfidf = px.bar(
+                            df_doc_kw, x="Skor TF-IDF", y="Kata Kunci", orientation='h',
+                            template=plotly_template, color="Skor TF-IDF",
+                            color_continuous_scale="Teal",
+                            text=df_doc_kw['Skor TF-IDF'].apply(lambda x: f"{x:.4f}")
+                        )
+                        fig_tfidf.update_traces(textposition='outside')
+                        fig_tfidf.update_layout(
+                            yaxis={'categoryorder': 'total ascending'},
+                            height=420,
+                            title=dict(text="Skor TF-IDF", font=dict(size=14)),
+                            coloraxis_showscale=False
+                        )
+                        st.plotly_chart(fig_tfidf, use_container_width=True)
+
+                    with chart_right:
+                        fig_freq = px.bar(
+                            df_doc_kw, x="Frekuensi", y="Kata Kunci", orientation='h',
+                            template=plotly_template, color="Frekuensi",
+                            color_continuous_scale="Purp",
+                            text="Frekuensi"
+                        )
+                        fig_freq.update_traces(textposition='outside')
+                        fig_freq.update_layout(
+                            yaxis={'categoryorder': 'total ascending'},
+                            height=420,
+                            title=dict(text="Frekuensi Kata (Raw Count)", font=dict(size=14)),
+                            coloraxis_showscale=False
+                        )
+                        st.plotly_chart(fig_freq, use_container_width=True)
+
+                    # --- Grouped Bar Chart gabungan ---
+                    st.markdown("##### 🔀 Perbandingan TF-IDF vs Frekuensi")
+                    # Normalisasi ke 0-1 agar bisa dibandingkan secara visual
+                    df_norm = df_doc_kw.copy()
+                    max_tfidf = df_norm['Skor TF-IDF'].max()
+                    max_freq = df_norm['Frekuensi'].max()
+                    df_norm['TF-IDF (Normalisasi)'] = df_norm['Skor TF-IDF'] / max_tfidf if max_tfidf > 0 else 0
+                    df_norm['Frekuensi (Normalisasi)'] = df_norm['Frekuensi'] / max_freq if max_freq > 0 else 0
+
+                    fig_combined = go.Figure()
+                    fig_combined.add_trace(go.Bar(
+                        y=df_norm['Kata Kunci'], x=df_norm['TF-IDF (Normalisasi)'],
+                        name='TF-IDF', orientation='h',
+                        marker_color='#4ECDC4',
+                        text=df_norm['Skor TF-IDF'].apply(lambda x: f"{x:.4f}"),
+                        textposition='outside'
+                    ))
+                    fig_combined.add_trace(go.Bar(
+                        y=df_norm['Kata Kunci'], x=df_norm['Frekuensi (Normalisasi)'],
+                        name='Frekuensi', orientation='h',
+                        marker_color='#BB8FCE',
+                        text=df_norm['Frekuensi'].astype(int).astype(str) + 'x',
+                        textposition='outside'
+                    ))
+                    fig_combined.update_layout(
+                        barmode='group',
+                        template=plotly_template,
+                        yaxis={'categoryorder': 'total ascending'},
+                        height=450,
+                        title=dict(text=f"TF-IDF vs Frekuensi — Dokumen #{doc_idx + 1}", font=dict(size=13)),
+                        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='center', x=0.5),
+                        xaxis_title="Skor Normalisasi (0–1)"
+                    )
+                    st.plotly_chart(fig_combined, use_container_width=True)
+
+                    # Tabel detail gabungan
+                    st.markdown("##### 📋 Tabel Detail Kata Kunci")
+                    df_table = df_doc_kw.copy()
+                    df_table.index = range(1, len(df_table) + 1)
+                    df_table.index.name = "Peringkat"
+                    st.dataframe(df_table, use_container_width=True)
+                else:
+                    st.warning("Dokumen ini tidak memiliki kata kunci yang terdeteksi setelah preprocessing.")
+
+            else:
+                # --- Grid View: Semua Dokumen ---
+                st.info(f"Menampilkan diagram batang kata kunci untuk **{total_docs} dokumen**. Scroll ke bawah untuk melihat semua.")
+
+                # Batasi jika terlalu banyak dokumen
+                max_grid_docs = 30
+                if total_docs > max_grid_docs:
+                    st.warning(f"Jumlah dokumen ({total_docs}) melebihi batas tampilan grid ({max_grid_docs}). Hanya {max_grid_docs} dokumen pertama yang ditampilkan. Gunakan mode '📄 Pilih Dokumen' untuk melihat dokumen lainnya.")
+                    display_count = max_grid_docs
+                else:
+                    display_count = total_docs
+
+                cols_per_row_doc = 2
+                rows_doc = (display_count + cols_per_row_doc - 1) // cols_per_row_doc
+
+                for row_i in range(rows_doc):
+                    cols_doc = st.columns(cols_per_row_doc)
+                    for col_i in range(cols_per_row_doc):
+                        d_idx = row_i * cols_per_row_doc + col_i
+                        if d_idx >= display_count:
+                            break
+
+                        with cols_doc[col_i]:
+                            row_data = tfidf_mat[d_idx].toarray().flatten()
+                            top_idx = row_data.argsort()[-10:][::-1]
+                            top_kw = [(feature_names[j], round(row_data[j], 4)) for j in top_idx if row_data[j] > 0]
+
+                            if top_kw:
+                                # Hitung frekuensi kata dokumen ini
+                                wf_doc = get_word_freq_doc(df['Teks_Clean'].iloc[d_idx])
+                                df_kw_grid = pd.DataFrame(top_kw, columns=["Kata", "TF-IDF"])
+                                df_kw_grid["Frekuensi"] = df_kw_grid["Kata"].apply(lambda k: wf_doc.get(k, 0))
+
+                                sent = df['Sentimen'].iloc[d_idx]
+
+                                # Grouped bar: TF-IDF + Frekuensi (normalisasi)
+                                max_t = df_kw_grid['TF-IDF'].max()
+                                max_f = df_kw_grid['Frekuensi'].max()
+                                df_kw_grid['TF-IDF_norm'] = df_kw_grid['TF-IDF'] / max_t if max_t > 0 else 0
+                                df_kw_grid['Freq_norm'] = df_kw_grid['Frekuensi'] / max_f if max_f > 0 else 0
+
+                                fig_grid = go.Figure()
+                                fig_grid.add_trace(go.Bar(
+                                    y=df_kw_grid['Kata'], x=df_kw_grid['TF-IDF_norm'],
+                                    name='TF-IDF', orientation='h',
+                                    marker_color='#4ECDC4',
+                                    text=df_kw_grid['TF-IDF'].apply(lambda x: f"{x:.3f}"),
+                                    textposition='outside',
+                                    showlegend=(d_idx == 0)
+                                ))
+                                fig_grid.add_trace(go.Bar(
+                                    y=df_kw_grid['Kata'], x=df_kw_grid['Freq_norm'],
+                                    name='Frekuensi', orientation='h',
+                                    marker_color='#BB8FCE',
+                                    text=df_kw_grid['Frekuensi'].astype(int).astype(str) + 'x',
+                                    textposition='outside',
+                                    showlegend=(d_idx == 0)
+                                ))
+
+                                preview_t = df['Teks_Asli'].iloc[d_idx]
+                                preview_short_t = (preview_t[:50] + "...") if len(preview_t) > 50 else preview_t
+
+                                fig_grid.update_layout(
+                                    barmode='group',
+                                    template=plotly_template,
+                                    yaxis={'categoryorder': 'total ascending'},
+                                    height=360,
+                                    title=dict(
+                                        text=f"Dok #{d_idx + 1} [{sent}]<br><sub>{preview_short_t}</sub>",
+                                        font=dict(size=11)
+                                    ),
+                                    margin=dict(t=60, b=10, l=10, r=10),
+                                    legend=dict(orientation='h', yanchor='bottom', y=1.08, xanchor='center', x=0.5, font=dict(size=9)),
+                                    xaxis_title=""
+                                )
+                                st.plotly_chart(fig_grid, use_container_width=True)
+                            else:
+                                st.info(f"Dok #{d_idx + 1}: Tidak ada kata kunci.")
+        else:
+            st.warning("Data TF-IDF belum tersedia. Jalankan analisis terlebih dahulu.")
+
+        # Ringkasan AI - Kata Kunci per Dokumen
+        if hasattr(st.session_state, 'tfidf_matrix') and hasattr(st.session_state, 'vectorizer'):
+            tfidf_m = st.session_state.tfidf_matrix
+            fn = st.session_state.vectorizer.get_feature_names_out()
+            doc_kw_samples = []
+            sample_count = min(5, len(df))
+            for si in range(sample_count):
+                r = tfidf_m[si].toarray().flatten()
+                ti = r.argsort()[-5:][::-1]
+                kws = [fn[j] for j in ti if r[j] > 0]
+                wf_s = Counter(df['Teks_Clean'].iloc[si].split())
+                kw_detail = ", ".join([f"{w}(tfidf={round(r[list(fn).index(w)],3)}, freq={wf_s.get(w,0)})" for w in kws[:5]])
+                doc_kw_samples.append(f"  Dok#{si+1} [{df['Topik'].iloc[si]}|{df['Sentimen'].iloc[si]}]: {kw_detail}")
+            # Hitung variasi
+            all_top_kws = set()
+            for si in range(len(df)):
+                r = tfidf_m[si].toarray().flatten()
+                ti = r.argsort()[-5:][::-1]
+                for j in ti:
+                    if r[j] > 0:
+                        all_top_kws.add(fn[j])
+            ctx_dkw = f"""Total Dokumen: {len(df)}
+Kata Kunci Unik (top-5 per dok): {len(all_top_kws)}
+Sampel Dokumen:
+{chr(10).join(doc_kw_samples)}"""
+            render_tab_insight_ui(client, MODEL_SMART, "doc_keywords", ctx_dkw, "Kata Kunci per Dokumen")
 
     # ========================
     # EXPORT SECTION
@@ -1345,6 +2198,3 @@ if st.session_state.analysis_done and st.session_state.data is not None:
             )
         else:
             st.button("📥 Generate laporan dulu", disabled=True, use_container_width=True)
-
-
-
